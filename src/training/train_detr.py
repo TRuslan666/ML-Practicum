@@ -1,12 +1,9 @@
-import sys
 import os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from util_detr import PlotMetricsCallback
 import json
-from functools import partial
 import logging
-
-
+import random
+from functools import partial
+import numpy as np
 import torch
 import torchvision
 import yaml
@@ -16,8 +13,11 @@ from transformers import (
     DetrImageProcessor,
     Trainer,
     TrainingArguments,
-    utils as tf_utils
+    utils as tf_utils,
+    set_seed,
 )
+
+from util_detr import PlotMetricsCallback
 
 
 # =====================================================================================
@@ -27,7 +27,8 @@ from transformers import (
 # файл как __mp_main__ и должен суметь найти эти определения. Если поместить их внутрь
 # блока main, получите AttributeError: Can't get attribute '...' on '__mp_main__'.
 # =====================================================================================
-os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+# CUDA_LAUNCH_BLOCKING сильно замедляет обучение и нужен только для отладки CUDA-ошибок.
+# Включить можно через переменную окружения снаружи: CUDA_LAUNCH_BLOCKING=1 python ...
 # 1. Создаем директорию для логов, если её нет
 log_dir = "results/logs"
 os.makedirs(log_dir, exist_ok=True)
@@ -166,27 +167,96 @@ def load_class_names(yaml_path: str) -> dict[int, str]:
     return {int(k): v for k, v in names.items()}
 
 
-def build_id2label(coco_json_path: str, yaml_path: str) -> dict[int, str]:
+def build_label_maps(coco_json_path: str, yaml_path: str) -> tuple[dict[int, str], dict[str, int], dict[int, int]]:
     """
-    Строит id2label, используя category_id из реального COCO-датасета (а не
-    предполагая, что они всегда 0..N-1 подряд) и подставляя настоящие названия
-    знаков из dataset.yaml вместо плейсхолдеров "class_N".
+    Строит непрерывные label-id для DETR и mapping COCO category_id -> label_id.
+
+    В COCO category_id могут быть непоследовательными. HuggingFace DETR ожидает,
+    что labels["class_labels"] лежат в диапазоне 0..num_labels-1, поэтому и
+    датасет, и config.id2label должны использовать одну и ту же непрерывную
+    индексацию.
     """
     with open(coco_json_path, "r", encoding="utf-8") as f:
         coco_data = json.load(f)
 
     real_names = load_class_names(yaml_path)
+    categories = sorted(coco_data["categories"], key=lambda cat: cat["id"])
 
-    id2label = {}
-    for cat in coco_data["categories"]:
-        cat_id = cat["id"]
-        # Если в yaml есть название для этого id — берём его, иначе оставляем как есть
-        id2label[cat_id] = real_names.get(cat_id, cat["name"])
+    old2new_id = {cat["id"]: idx for idx, cat in enumerate(categories)}
+    id2label = {
+        old2new_id[cat["id"]]: real_names.get(cat["id"], cat["name"])
+        for cat in categories
+    }
+    label2id = {label: idx for idx, label in id2label.items()}
 
-    return id2label
+    return id2label, label2id, old2new_id
 
+
+def seed_everything(seed: int = 42) -> None:
+    """Фиксирует основные генераторы случайности для воспроизводимости."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    set_seed(seed)
+
+
+class DetrTrainer(Trainer):
+    """Trainer с отдельным learning rate для backbone DETR."""
+
+    def __init__(self, *args, backbone_learning_rate: float = 1e-5, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.backbone_learning_rate = backbone_learning_rate
+
+    def create_optimizer(self):
+        if self.optimizer is None:
+            decay_parameters = self.get_decay_parameter_names(self.model)
+
+            def is_backbone(name: str) -> bool:
+                return "backbone" in name
+
+            optimizer_grouped_parameters = [
+                {
+                    "params": [
+                        p for n, p in self.model.named_parameters()
+                        if p.requires_grad and n in decay_parameters and not is_backbone(n)
+                    ],
+                    "weight_decay": self.args.weight_decay,
+                    "lr": self.args.learning_rate,
+                },
+                {
+                    "params": [
+                        p for n, p in self.model.named_parameters()
+                        if p.requires_grad and n not in decay_parameters and not is_backbone(n)
+                    ],
+                    "weight_decay": 0.0,
+                    "lr": self.args.learning_rate,
+                },
+                {
+                    "params": [
+                        p for n, p in self.model.named_parameters()
+                        if p.requires_grad and n in decay_parameters and is_backbone(n)
+                    ],
+                    "weight_decay": self.args.weight_decay,
+                    "lr": self.backbone_learning_rate,
+                },
+                {
+                    "params": [
+                        p for n, p in self.model.named_parameters()
+                        if p.requires_grad and n not in decay_parameters and is_backbone(n)
+                    ],
+                    "weight_decay": 0.0,
+                    "lr": self.backbone_learning_rate,
+                },
+            ]
+            optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
+            self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+        return self.optimizer
 
 def main():
+    seed_everything(42)
+
     # -----------------------------------------------------------------------
     # 1. Устройство
     # -----------------------------------------------------------------------
@@ -205,21 +275,12 @@ def main():
     # -----------------------------------------------------------------------
     # 3. Реальные названия классов (а не "class_0", "class_1"...)
     # -----------------------------------------------------------------------
-    id2label = build_id2label(train_ann_file, yaml_path)
-    label2id = {v: k for k, v in id2label.items()}
+    id2label, label2id, old2new_id = build_label_maps(train_ann_file, yaml_path)
     num_labels = len(id2label)
 
     print(f"Найдено классов: {num_labels}")
-    print(f"category_id диапазон: {min(id2label.keys())}..{max(id2label.keys())}")
-
-    # Проверка непрерывности индексов 0..N-1 — DETR этого ожидает
-    expected_ids = set(range(num_labels))
-    actual_ids = set(id2label.keys())
-    if actual_ids != expected_ids:
-        print("[WARN] category_id не образуют непрерывный диапазон 0..N-1!")
-        print(f"       Ожидалось: {sorted(expected_ids)[:5]}...")
-        print(f"       Получено:  {sorted(actual_ids)[:5]}...")
-        print("       Это может привести к ошибкам индексации при обучении.")
+    print(f"label_id диапазон DETR: {min(id2label.keys())}..{max(id2label.keys())}")
+    print(f"COCO category_id -> label_id: {old2new_id}")
 
     # -----------------------------------------------------------------------
     # 4. Процессор и модель
@@ -260,10 +321,12 @@ def main():
         output_dir="results/models/detr_finetuned_results",
         per_device_train_batch_size=4,
         per_device_eval_batch_size=4,
-        num_train_epochs=1,
-        learning_rate=1e-05,
+        num_train_epochs=50,
+        learning_rate=1e-4,
         weight_decay=1e-4,
         logging_steps=10,
+        warmup_ratio=0.1,
+        lr_scheduler_type="cosine",
         remove_unused_columns=False,
 
         # Валидация на каждой эпохе + сохранение лучшего чекпоинта
@@ -287,13 +350,14 @@ def main():
     # -----------------------------------------------------------------------
     # 7. Trainer
     # -----------------------------------------------------------------------
-    trainer = Trainer(
+    trainer = DetrTrainer(
         model=model,
         args=training_args,
         data_collator=partial(collate_fn, processor=processor),
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        callbacks=[PlotMetricsCallback(output_dir="results/plots")]
+        callbacks=[PlotMetricsCallback(output_dir="results/plots")],
+        backbone_learning_rate=1e-5,
     )
 
     # -----------------------------------------------------------------------
