@@ -1,6 +1,6 @@
 from ultralytics.data import utils
 
-from src.training.train import train_yolo
+from src.training.train_yolov8 import train_yolo
 from src.utils.config_loader import load_config
 from src.utils.logger import setup_logger
 from src.evaluation.save_metrics import save_metrics

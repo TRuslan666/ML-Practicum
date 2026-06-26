@@ -223,3 +223,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+src/dataset/processed/train
+src/dataset/processed/val

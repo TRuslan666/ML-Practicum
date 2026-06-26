@@ -1,4 +1,4 @@
-model_path: src/models/yolo/weights/last.pt
+model_path: src/models/yolov8/weights/last.pt
 
 dataset:
   path: src/dataset/dataset.yaml

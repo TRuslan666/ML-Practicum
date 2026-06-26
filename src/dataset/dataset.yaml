@@ -1,6 +1,6 @@
 path: src/dataset 
-train: train/images
-val: val/images
+train: processed/train/images
+val: processed/val/images
 
 nc: 43
 names:
