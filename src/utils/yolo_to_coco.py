@@ -31,7 +31,7 @@ SSD и EfficientDet (через HuggingFace transformers / torchvision / timm).
 
 Использование:
 
-    python yolo_to_coco.py --dataset_root dataset --classes classes.txt
+    python -m src.utils.yolo_to_coco --dataset_root src/dataset/processed --classes src/dataset/processed/classes.txt
 
     где classes.txt — текстовый файл с названиями классов, одно на строку,
     в том порядке, в котором они закодированы как 0, 1, 2, ... в .txt-аннотациях.
@@ -43,7 +43,6 @@ SSD и EfficientDet (через HuggingFace transformers / torchvision / timm).
 import argparse
 import json
 import os
-import sys
 from pathlib import Path
 
 from PIL import Image
@@ -146,6 +145,9 @@ def convert_split(images_dir: Path, labels_dir: Path, class_names: list[str],
                 cls_id, x_c, y_c, w, h = parts
                 cls_id = int(float(cls_id))
                 x_c, y_c, w, h = map(float, (x_c, y_c, w, h))
+                if cls_id < 0 or cls_id >= len(class_names):
+                    print(f"[WARN] Неизвестный class_id={cls_id} в {label_path}:{line_num} — пропущен")
+                    continue
 
                 # Денормализация: YOLO хранит относительные координаты центра и размеры,
                 # COCO хранит абсолютные [x_min, y_min, width, height] в пикселях.
@@ -159,6 +161,9 @@ def convert_split(images_dir: Path, labels_dir: Path, class_names: list[str],
                 y_min = max(0.0, y_min)
                 box_w = min(box_w, width - x_min)
                 box_h = min(box_h, height - y_min)
+                if box_w <= 0 or box_h <= 0:
+                    print(f"[WARN] Вырожденный bbox в {label_path}:{line_num} — пропущен")
+                    continue
 
                 coco["annotations"].append({
                     "id": ann_id,
