@@ -1,25 +1,35 @@
-from ultralytics import YOLO
 from ultralytics.data import utils
 
+from src.training.train import train_yolo
+from src.utils.config_loader import load_config
+from src.utils.logger import setup_logger
+from src.evaluation.save_metrics import save_metrics
+from src.evaluation.save_metrics import save_plots
 
-# Разрешаем YOLO читать формат .ppm
-utils.IMG_FORMATS.add('ppm') 
+
+utils.IMG_FORMATS.add("ppm")
+
 
 def main():
-    # Загружаем базовую модель
-    model = YOLO(r"C:\Users\lavah\Desktop\ML-Project\src\models\yolo\weights\last.pt") 
 
-    # Запускаем обучение
-    model.train(
-        data="C:\Users\lavah\Desktop\ML-Project\src\dataset\dataset.yaml", 
-        epochs=50, 
-        imgsz=640, 
-        batch=16, 
-        device=0,      
-        amp=False,     
-        cache=False,   
-        workers=0      
+    logger = setup_logger()
+
+    logger.info("Loading config")
+
+    config = load_config(
+        "configs/yolov8.yaml"
     )
 
-if __name__ == '__main__':
+    logger.info("Training started")
+
+    train_yolo(config)
+
+    save_metrics()
+    
+    save_plots()
+
+    logger.info("Training finished")
+
+
+if __name__ == "__main__":
     main()

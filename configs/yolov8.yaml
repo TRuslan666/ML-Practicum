@@ -1,0 +1,13 @@
+model_path: src/models/yolo/weights/last.pt
+
+dataset:
+  path: src/dataset/dataset.yaml
+
+training:
+  epochs: 50
+  imgsz: 640
+  batch: 16
+  device: 0
+  amp: false
+  cache: false
+  workers: 0
