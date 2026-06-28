@@ -1,608 +1,244 @@
+"""Stable Faster R-CNN training for this project.
+
+The project stores detection labels as COCO JSON files generated from YOLO
+labels.  This module intentionally does not depend on the external
+``torch_utils``/``datasets`` training template that used to be pasted here: it
+uses only PyTorch + TorchVision and is callable from ``main.py`` via
+``train_faster_rcnn_from_config``.
+
+Defaults are conservative for a GTX 1660 Super (6 GB VRAM): no AMP, small batch,
+low learning rate, gradient clipping and strict box/loss validation to prevent
+NaN/Inf from corrupting the model during training.
 """
-USAGE
 
-# training with Faster RCNN ResNet50 FPN model without mosaic or any other augmentation:
-python train.py --model fasterrcnn_resnet50_fpn --epochs 2 --data data_configs/voc.yaml --mosaic 0 --batch 4
+from __future__ import annotations
 
-# Training on ResNet50 FPN with custom project folder name with mosaic augmentation (ON by default):
-python train.py --model fasterrcnn_resnet50_fpn --epochs 2 --data data_configs/voc.yaml --name resnet50fpn_voc --batch 4
-
-# Training on ResNet50 FPN with custom project folder name with mosaic augmentation (ON by default) and added training augmentations:
-python train.py --model fasterrcnn_resnet50_fpn --epochs 2 --use-train-aug --data data_configs/voc.yaml --name resnet50fpn_voc --batch 4
-
-# Distributed training:
-export CUDA_VISIBLE_DEVICES=0,1
-python -m torch.distributed.launch --nproc_per_node=2 --use_env train.py --data data_configs/smoke.yaml --epochs 100 --model fasterrcnn_resnet50_fpn --name smoke_training --batch 16
-"""
-from torch_utils.engine import (
-    train_one_epoch, evaluate, utils
-)
-from torch.utils.data import (
-    distributed, RandomSampler, SequentialSampler
-)
-from datasets import (
-    create_train_dataset, create_valid_dataset, 
-    create_train_loader, create_valid_loader
-)
-from models.create_fasterrcnn_model import create_model
-from utils.general import (
-    set_training_dir, Averager, 
-    save_model, save_loss_plot,
-    show_tranformed_image,
-    save_mAP, save_model_state, SaveBestModel,
-    yaml_save, init_seeds, EarlyStopping
-)
-from utils.logging import (
-    set_log, coco_log,
-    set_summary_writer, 
-    tensorboard_loss_log, 
-    tensorboard_map_log,
-    csv_log,
-    wandb_log, 
-    wandb_save_model,
-    wandb_init
-)
+import json
+import math
+import random
+from collections import defaultdict
+from pathlib import Path
+from typing import Any
 
 import torch
-import argparse
-import yaml
-import numpy as np
-import torchinfo
-import os
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset
+from torchvision.models.detection import FasterRCNN_ResNet50_FPN_Weights, fasterrcnn_resnet50_fpn
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.ops import clip_boxes_to_image
+from torchvision.transforms import functional as F
 
-torch.multiprocessing.set_sharing_strategy('file_system')
+# .ppm is used by the traffic-sign dataset in this repository. Pillow can read it,
+# so no extra conversion step is required.
+SUPPORTED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".ppm", ".pgm", ".tif", ".tiff"}
 
-RANK = int(os.getenv('RANK', -1))
 
-# For same annotation colors each time.
-np.random.seed(42)
+def _seed_everything(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    # Determinism and disabled benchmark make the first CUDA runs less spiky on
+    # small 6 GB GPUs and make failures easier to reproduce.
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
 
-def parse_opt():
-    # Construct the argument parser.
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        '-m', '--model', 
-        default='fasterrcnn_resnet50_fpn_v2',
-        help='name of the model'
+
+def _resolve_path(path: str | Path) -> Path:
+    path = Path(path)
+    if path.is_absolute():
+        return path
+    return Path(__file__).resolve().parents[2] / path
+
+
+class CocoDetectionDataset(Dataset):
+    """Minimal COCO dataset reader with aggressive target sanitization."""
+
+    def __init__(self, images_dir: str | Path, annotations_file: str | Path, min_box_size: float = 2.0) -> None:
+        self.images_dir = _resolve_path(images_dir)
+        self.annotations_file = _resolve_path(annotations_file)
+        self.min_box_size = float(min_box_size)
+
+        with self.annotations_file.open("r", encoding="utf-8") as file:
+            coco = json.load(file)
+
+        self.categories = sorted(coco.get("categories", []), key=lambda item: item["id"])
+        self.category_to_label = {category["id"]: idx + 1 for idx, category in enumerate(self.categories)}
+        self.label_to_name = {idx + 1: category["name"] for idx, category in enumerate(self.categories)}
+
+        annotations_by_image: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for annotation in coco.get("annotations", []):
+            annotations_by_image[annotation["image_id"]].append(annotation)
+
+        self.images: list[dict[str, Any]] = []
+        for image in coco.get("images", []):
+            image_path = self.images_dir / image["file_name"]
+            if image_path.suffix.lower() in SUPPORTED_IMAGE_EXTS and image_path.exists():
+                self.images.append({**image, "path": image_path, "annotations": annotations_by_image[image["id"]]})
+
+        if not self.images:
+            raise FileNotFoundError(f"No images from {self.annotations_file} were found in {self.images_dir}")
+
+    def __len__(self) -> int:
+        return len(self.images)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        image_info = self.images[index]
+        image = Image.open(image_info["path"]).convert("RGB")
+        image_tensor = F.to_tensor(image)
+        height, width = image_tensor.shape[-2:]
+
+        boxes: list[list[float]] = []
+        labels: list[int] = []
+        areas: list[float] = []
+        iscrowd: list[int] = []
+
+        for annotation in image_info["annotations"]:
+            bbox = annotation.get("bbox", [])
+            if len(bbox) != 4 or not all(math.isfinite(float(value)) for value in bbox):
+                continue
+            x, y, box_width, box_height = map(float, bbox)
+            if box_width < self.min_box_size or box_height < self.min_box_size:
+                continue
+            label = self.category_to_label.get(annotation.get("category_id"))
+            if label is None:
+                continue
+
+            box = torch.tensor([[x, y, x + box_width, y + box_height]], dtype=torch.float32)
+            box = clip_boxes_to_image(box, (height, width))[0]
+            clipped_width = float(box[2] - box[0])
+            clipped_height = float(box[3] - box[1])
+            if clipped_width < self.min_box_size or clipped_height < self.min_box_size:
+                continue
+
+            boxes.append(box.tolist())
+            labels.append(label)
+            areas.append(clipped_width * clipped_height)
+            iscrowd.append(int(annotation.get("iscrowd", 0)))
+
+        target = {
+            "boxes": torch.as_tensor(boxes, dtype=torch.float32).reshape(-1, 4),
+            "labels": torch.as_tensor(labels, dtype=torch.int64),
+            "image_id": torch.tensor([int(image_info["id"])]),
+            "area": torch.as_tensor(areas, dtype=torch.float32),
+            "iscrowd": torch.as_tensor(iscrowd, dtype=torch.int64),
+        }
+        return image_tensor, target
+
+
+def _collate_fn(batch: list[tuple[torch.Tensor, dict[str, torch.Tensor]]]) -> tuple[list[torch.Tensor], list[dict[str, torch.Tensor]]]:
+    images, targets = zip(*batch)
+    return list(images), list(targets)
+
+
+def _build_model(num_classes: int, image_size: int) -> torch.nn.Module:
+    weights = FasterRCNN_ResNet50_FPN_Weights.DEFAULT
+    model = fasterrcnn_resnet50_fpn(weights=weights, box_detections_per_img=100)
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+
+    # Keep memory use predictable on GTX 1660 Super. TorchVision still preserves
+    # aspect ratio internally, but caps the long side at 800 by default.
+    model.transform.min_size = (image_size,)
+    model.transform.max_size = max(image_size, 800)
+    return model
+
+
+def _assert_finite_targets(targets: list[dict[str, torch.Tensor]]) -> None:
+    for target in targets:
+        boxes = target["boxes"]
+        if not torch.isfinite(boxes).all():
+            raise ValueError(f"NaN/Inf in target boxes before forward(): image_id={target['image_id'].item()}")
+        if boxes.numel() and ((boxes[:, 2] <= boxes[:, 0]) | (boxes[:, 3] <= boxes[:, 1])).any():
+            raise ValueError(f"Invalid target box with non-positive size: image_id={target['image_id'].item()}")
+
+
+def train_faster_rcnn_from_config(config: dict[str, Any]) -> torch.nn.Module:
+    """Train Faster R-CNN using ``configs/faster_rcnn.yaml`` style settings."""
+
+    seed = int(config.get("seed", 42))
+    _seed_everything(seed)
+
+    device_name = config.get("device", "cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(device_name if device_name != "cuda" or torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    image_size = int(config.get("imgsz", 512))
+    min_box_size = float(config.get("min_box_size", 2.0))
+    train_dataset = CocoDetectionDataset(config["train_images"], config["train_annotations"], min_box_size=min_box_size)
+    val_dataset = CocoDetectionDataset(config["val_images"], config["val_annotations"], min_box_size=min_box_size)
+
+    # +1 for background class required by TorchVision detection heads.
+    num_classes = int(config.get("num_classes", len(train_dataset.categories))) + 1
+    model = _build_model(num_classes=num_classes, image_size=image_size).to(device)
+
+    batch_size = int(config.get("batch", 2))
+    workers = int(config.get("dataloader_num_workers", 0))
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=workers, collate_fn=_collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=workers, collate_fn=_collate_fn)
+
+    optimizer = torch.optim.AdamW(
+        [parameter for parameter in model.parameters() if parameter.requires_grad],
+        lr=float(config.get("lr", 1e-4)),
+        weight_decay=float(config.get("weight_decay", 1e-4)),
+        eps=1e-8,
     )
-    parser.add_argument(
-        '--data', 
-        default=None,
-        help='path to the data config file'
-    )
-    parser.add_argument(
-        '-d', '--device', 
-        default='cuda',
-        help='computation/training device, default is GPU if GPU present'
-    )
-    parser.add_argument(
-        '-e', '--epochs', 
-        default=5,
-        type=int,
-        help='number of epochs to train for'
-    )
-    parser.add_argument(
-        '-j', '--workers', 
-        default=4,
-        type=int,
-        help='number of workers for data processing/transforms/augmentations'
-    )
-    parser.add_argument(
-        '-b', '--batch', 
-        default=4, 
-        type=int, 
-        help='batch size to load the data'
-    )
-    parser.add_argument(
-        '--lr', 
-        default=0.001,
-        help='learning rate for the optimizer',
-        type=float
-    )
-    parser.add_argument(
-        '-ims', '--imgsz',
-        default=640, 
-        type=int, 
-        help='image size to feed to the network'
-    )
-    parser.add_argument(
-        '-n', '--name', 
-        default=None, 
-        type=str, 
-        help='training result dir name in outputs/training/, (default res_#)'
-    )
-    parser.add_argument(
-        '-vt', '--vis-transformed', 
-        dest='vis_transformed', 
-        action='store_true',
-        help='visualize transformed images fed to the network'
-    )
-    parser.add_argument(
-        '--mosaic', 
-        default=0.0,
-        type=float,
-        help='probability of applying mosaic, (default, always apply)'
-    )
-    parser.add_argument(
-        '-uta', '--use-train-aug', 
-        dest='use_train_aug', 
-        action='store_true',
-        help='whether to use train augmentation, blur, gray, \
-              brightness contrast, color jitter, random gamma \
-              all at once'
-    )
-    parser.add_argument(
-        '-ca', '--cosine-annealing', 
-        dest='cosine_annealing', 
-        action='store_true',
-        help='use cosine annealing warm restarts'
-    )
-    parser.add_argument(
-        '-w', '--weights', 
-        default=None, 
-        type=str,
-        help='path to model weights if using pretrained weights'
-    )
-    parser.add_argument(
-        '-r', '--resume-training', 
-        dest='resume_training', 
-        action='store_true',
-        help='whether to resume training, if true, \
-            loads previous training plots and epochs \
-            and also loads the otpimizer state dictionary'
-    )
-    parser.add_argument(
-        '-st', '--square-training',
-        dest='square_training',
-        action='store_true',
-        help='Resize images to square shape instead of aspect ratio resizing \
-              for single image training. For mosaic training, this resizes \
-              single images to square shape first then puts them on a \
-              square canvas.'
-    )
-    parser.add_argument(
-        '--world-size', 
-        default=1, 
-        type=int, 
-        help='number of distributed processes'
-    )
-    parser.add_argument(
-        '--dist-url',
-        default='env://',
-        type=str,
-        help='url used to set up the distributed training'
-    )
-    parser.add_argument(
-        '-dw', '--disable-wandb',
-        dest="disable_wandb",
-        action='store_true',
-        help='whether to use the wandb'
-    )
-    parser.add_argument(
-        '--sync-bn',
-        dest='sync_bn',
-        help='use sync batch norm',
-        action='store_true'
-    )
-    parser.add_argument(
-        '--amp',
-        action='store_true',
-        help='use automatic mixed precision'
-    )
-    parser.add_argument(
-        '--patience',
-        default=10,
-        help='number of epochs to wait for when mAP does not increase to \
-              trigger early stopping',
-        type=int
-    )
-    parser.add_argument(
-        '--seed',
-        default=0,
-        type=int ,
-        help='golabl seed for training'
-    )
-    parser.add_argument(
-        '--project-dir',
-        dest='project_dir',
-        default=None,
-        help='save resutls to custom dir instead of `outputs` directory, \
-              --project-dir will be named if not already present',
-        type=str
-    )
-    parser.add_argument(
-        '--label-type',
-        dest='label_type',
-        default='pascal_voc',
-        choices=['pascal_voc', 'yolo'],
-        help='label files type, you can either Pascal VOC XML type or, \
-              yolo txt type label files'
-    )
-    parser.add_argument(
-        '--optimizer',
-        default=None,
-        choices=['SGD', 'AdamW']
-    )
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=int(config.get("lr_step_size", 8)), gamma=0.1)
+    grad_clip_norm = float(config.get("grad_clip_norm", 1.0))
+    epochs = int(config.get("epochs", 50))
 
-    args = vars(parser.parse_args())
-    return args
+    output_dir = _resolve_path(config.get("project", "results/models")) / config.get("name", "faster_rcnn_experiment")
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-def main(args):
-    # Initialize distributed mode.
-    utils.init_distributed_mode(args)
+    print(f"Device: {device}; train images: {len(train_dataset)}; val images: {len(val_dataset)}")
+    print(f"Faster R-CNN classes including background: {num_classes}; batch={batch_size}; imgsz={image_size}; amp=False")
 
-    # Initialize W&B with project name.
-    if not args['disable_wandb']:
-        wandb_init(name=args['name'])
-    # Load the data configurations
-    with open(args['data']) as file:
-        data_configs = yaml.safe_load(file)
+    best_loss = float("inf")
+    for epoch in range(1, epochs + 1):
+        model.train()
+        epoch_losses: list[float] = []
+        for images, targets in train_loader:
+            _assert_finite_targets(targets)
+            images = [image.to(device, non_blocking=True) for image in images]
+            targets = [{key: value.to(device, non_blocking=True) for key, value in target.items()} for target in targets]
 
-    init_seeds(args['seed'] + 1 + RANK, deterministic=True)
-    
-    # Settings/parameters/constants.
-    TRAIN_DIR_IMAGES = os.path.normpath(data_configs['TRAIN_DIR_IMAGES'])
-    TRAIN_DIR_LABELS = os.path.normpath(data_configs['TRAIN_DIR_LABELS'])
-    VALID_DIR_IMAGES = os.path.normpath(data_configs['VALID_DIR_IMAGES'])
-    VALID_DIR_LABELS = os.path.normpath(data_configs['VALID_DIR_LABELS'])
-    CLASSES = data_configs['CLASSES']
-    NUM_CLASSES = data_configs['NC']
-    NUM_WORKERS = args['workers']
-    DEVICE = torch.device(args['device'])
-    print("device",DEVICE)
-    NUM_EPOCHS = args['epochs']
-    SAVE_VALID_PREDICTIONS = data_configs['SAVE_VALID_PREDICTION_IMAGES']
-    BATCH_SIZE = args['batch']
-    VISUALIZE_TRANSFORMED_IMAGES = args['vis_transformed']
-    OUT_DIR = set_training_dir(args['name'], args['project_dir'])
-    COLORS = np.random.uniform(0, 1, size=(len(CLASSES), 3))
-    SCALER = torch.cuda.amp.GradScaler() if args['amp'] else None
-    # Set logging file.
-    set_log(OUT_DIR)
-    writer = set_summary_writer(OUT_DIR)
+            loss_dict = model(images, targets)
+            losses = sum(loss for loss in loss_dict.values())
+            if not torch.isfinite(losses):
+                details = {name: float(value.detach().cpu()) for name, value in loss_dict.items()}
+                raise FloatingPointError(f"Non-finite Faster R-CNN loss at epoch {epoch}: {details}")
 
-    yaml_save(file_path=os.path.join(OUT_DIR, 'opt.yaml'), data=args)
+            optimizer.zero_grad(set_to_none=True)
+            losses.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
+            optimizer.step()
+            epoch_losses.append(float(losses.detach().cpu()))
 
-    # Model configurations
-    IMAGE_SIZE = args['imgsz']
-    
-    train_dataset = create_train_dataset(
-        TRAIN_DIR_IMAGES, 
-        TRAIN_DIR_LABELS,
-        IMAGE_SIZE, 
-        CLASSES,
-        use_train_aug=args['use_train_aug'],
-        mosaic=args['mosaic'],
-        square_training=args['square_training'],
-        label_type=args['label_type']
-    )
-    valid_dataset = create_valid_dataset(
-        VALID_DIR_IMAGES, 
-        VALID_DIR_LABELS, 
-        IMAGE_SIZE, 
-        CLASSES,
-        square_training=args['square_training'],
-        label_type=args['label_type']
-    )
-    print('Creating data loaders')
-    if args['distributed']:
-        train_sampler = distributed.DistributedSampler(
-            train_dataset
-        )
-        valid_sampler = distributed.DistributedSampler(
-            valid_dataset, shuffle=False
-        )
-    else:
-        train_sampler = RandomSampler(train_dataset)
-        valid_sampler = SequentialSampler(valid_dataset)
+        scheduler.step()
+        train_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else float("nan")
+        print(f"Epoch {epoch:03d}/{epochs}: train_loss={train_loss:.5f}")
 
-    train_loader = create_train_loader(
-        train_dataset, BATCH_SIZE, NUM_WORKERS, batch_sampler=train_sampler
-    )
-    valid_loader = create_valid_loader(
-        valid_dataset, BATCH_SIZE, NUM_WORKERS, batch_sampler=valid_sampler
-    )
-    print(f"Number of training samples: {len(train_dataset)}")
-    print(f"Number of validation samples: {len(valid_dataset)}\n")
+        checkpoint = {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "num_classes": num_classes,
+            "label_to_name": train_dataset.label_to_name,
+            "config": config,
+        }
+        torch.save(checkpoint, output_dir / "last.pt")
+        if train_loss < best_loss:
+            best_loss = train_loss
+            torch.save(checkpoint, output_dir / "best.pt")
 
-    if VISUALIZE_TRANSFORMED_IMAGES:
-        show_tranformed_image(train_loader, DEVICE, CLASSES, COLORS)
+        # Cheap validation smoke pass: catches CUDA/memory/shape issues without a
+        # slow COCO mAP dependency in the core training script.
+        model.eval()
+        with torch.no_grad():
+            for images, _targets in val_loader:
+                _ = model([image.to(device, non_blocking=True) for image in images])
+                break
 
-    # Initialize the Averager class.
-    train_loss_hist = Averager()
-    # Train and validation loss lists to store loss values of all
-    # iterations till ena and plot graphs for all iterations.
-    train_loss_list = []
-    loss_cls_list = []
-    loss_box_reg_list = []
-    loss_objectness_list = []
-    loss_rpn_list = []
-    train_loss_list_epoch = []
-    val_map_05 = []
-    val_map = []
-    start_epochs = 0
-
-    if args['weights'] is None:
-        print('Building model from models folder...')
-        build_model = create_model[args['model']]
-        model = build_model(num_classes=NUM_CLASSES, pretrained=True)
-
-    # Load pretrained weights if path is provided.
-    if args['weights'] is not None:
-        print('Loading pretrained weights...')
-        
-        # Load the pretrained checkpoint.
-        checkpoint = torch.load(args['weights'], map_location=DEVICE) 
-        keys = list(checkpoint['model_state_dict'].keys())
-        ckpt_state_dict = checkpoint['model_state_dict']
-        # Get the number of classes from the loaded checkpoint.
-        old_classes = ckpt_state_dict['roi_heads.box_predictor.cls_score.weight'].shape[0]
-
-        # Build the new model with number of classes same as checkpoint.
-        build_model = create_model[args['model']]
-        model = build_model(num_classes=old_classes)
-        # Load weights.
-        model.load_state_dict(ckpt_state_dict)
-
-        # Change output features for class predictor and box predictor
-        # according to current dataset classes.
-        in_features = model.roi_heads.box_predictor.cls_score.in_features
-        model.roi_heads.box_predictor.cls_score = torch.nn.Linear(
-            in_features=in_features, out_features=NUM_CLASSES, bias=True
-        )
-        model.roi_heads.box_predictor.bbox_pred = torch.nn.Linear(
-            in_features=in_features, out_features=NUM_CLASSES*4, bias=True
-        )
-
-        if args['resume_training']:
-            print('RESUMING TRAINING...')
-            # Update the starting epochs, the batch-wise loss list, 
-            # and the epoch-wise loss list.
-            if checkpoint['epoch']:
-                start_epochs = checkpoint['epoch']
-                print(f"Resuming from epoch {start_epochs}...")
-            if checkpoint['train_loss_list']:
-                print('Loading previous batch wise loss list...')
-                train_loss_list = checkpoint['train_loss_list']
-            if checkpoint['train_loss_list_epoch']:
-                print('Loading previous epoch wise loss list...')
-                train_loss_list_epoch = checkpoint['train_loss_list_epoch']
-            if checkpoint['val_map']:
-                print('Loading previous mAP list')
-                val_map = checkpoint['val_map']
-            if checkpoint['val_map_05']:
-                val_map_05 = checkpoint['val_map_05']
-
-    # Make the model transform's `min_size` same as `imgsz` argument. 
-    model.transform.min_size = (args['imgsz'], )
-    model = model.to(DEVICE)
-    if args['sync_bn'] and args['distributed']:
-        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-    if args['distributed']:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[args['gpu']]
-        )
-    try:
-        torchinfo.summary(
-            model, 
-            device=DEVICE, 
-            input_size=(BATCH_SIZE, 3, IMAGE_SIZE, IMAGE_SIZE),
-            row_settings=["var_names"],
-            col_names=("input_size", "output_size", "num_params") 
-        )
-    except:
-        print(model)
-    # Total parameters and trainable parameters.
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"{total_params:,} total parameters.")
-    total_trainable_params = sum(
-        p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"{total_trainable_params:,} training parameters.")
-    # Get the model parameters.
-    params = [p for p in model.parameters() if p.requires_grad]
-    # Define the optimizer.
-
-    if args['optimizer'] is not None:
-        optimizer = getattr(torch.optim, args['optimizer'])(params, lr=args['lr'], momentum=0.9, nesterov=True)
-        print(f"Using {optimizer} for {args['model']}")
-    else:
-        if 'dinov3' in args['model']:
-            optimizer = torch.optim.AdamW(params, lr=args['lr'])
-            print(f"Using {optimizer} for {args['model']}")
-        else:
-            optimizer = torch.optim.SGD(params, lr=args['lr'], momentum=0.9, nesterov=True)
-            print(f"Using {optimizer} for {args['model']}")
-    if args['resume_training']: 
-        # LOAD THE OPTIMIZER STATE DICTIONARY FROM THE CHECKPOINT.
-        print('Loading optimizer state dictionary...')
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-
-    if args['cosine_annealing']:
-        # LR will be zero as we approach `steps` number of epochs each time.
-        # If `steps = 5`, LR will slowly reduce to zero every 5 epochs.
-        steps = NUM_EPOCHS + 10
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            optimizer, 
-            T_0=steps,
-            T_mult=1,
-            verbose=False
-        )
-    else:
-        scheduler = None
-
-    save_best_model = SaveBestModel()
-    early_stopping = EarlyStopping(patience=args['patience'])
-
-    for epoch in range(start_epochs, NUM_EPOCHS):
-        train_loss_hist.reset()
-
-        _, batch_loss_list, \
-            batch_loss_cls_list, \
-            batch_loss_box_reg_list, \
-            batch_loss_objectness_list, \
-            batch_loss_rpn_list = train_one_epoch(
-            model, 
-            optimizer, 
-            train_loader, 
-            DEVICE, 
-            epoch, 
-            train_loss_hist,
-            print_freq=100,
-            scheduler=scheduler,
-            scaler=SCALER
-        )
-
-        stats, val_pred_image = evaluate(
-            model, 
-            valid_loader, 
-            device=DEVICE,
-            save_valid_preds=SAVE_VALID_PREDICTIONS,
-            out_dir=OUT_DIR,
-            classes=CLASSES,
-            colors=COLORS
-        )
-
-        # Append the current epoch's batch-wise losses to the `train_loss_list`.
-        train_loss_list.extend(batch_loss_list)
-        loss_cls_list.append(np.mean(np.array(batch_loss_cls_list,)))
-        loss_box_reg_list.append(np.mean(np.array(batch_loss_box_reg_list)))
-        loss_objectness_list.append(np.mean(np.array(batch_loss_objectness_list)))
-        loss_rpn_list.append(np.mean(np.array(batch_loss_rpn_list)))
-
-        # Append curent epoch's average loss to `train_loss_list_epoch`.
-        train_loss_list_epoch.append(train_loss_hist.value)
-        val_map_05.append(stats[1])
-        val_map.append(stats[0])
-
-        # Save loss plot for batch-wise list.
-        save_loss_plot(OUT_DIR, train_loss_list)
-        # Save loss plot for epoch-wise list.
-        save_loss_plot(
-            OUT_DIR, 
-            train_loss_list_epoch,
-            'epochs',
-            'train loss',
-            save_name='train_loss_epoch' 
-        )
-        # Save all the training loss plots.
-        save_loss_plot(
-            OUT_DIR, 
-            loss_cls_list, 
-            'epochs', 
-            'loss cls',
-            save_name='train_loss_cls'
-        )
-        save_loss_plot(
-            OUT_DIR, 
-            loss_box_reg_list, 
-            'epochs', 
-            'loss bbox reg',
-            save_name='train_loss_bbox_reg'
-        )
-        save_loss_plot(
-            OUT_DIR,
-            loss_objectness_list,
-            'epochs',
-            'loss obj',
-            save_name='train_loss_obj'
-        )
-        save_loss_plot(
-            OUT_DIR,
-            loss_rpn_list,
-            'epochs',
-            'loss rpn bbox',
-            save_name='train_loss_rpn_bbox'
-        )
-
-        # Save mAP plots.
-        save_mAP(OUT_DIR, val_map_05, val_map)
-
-        # Save batch-wise train loss plot using TensorBoard. Better not to use it
-        # as it increases the TensorBoard log sizes by a good extent (in 100s of MBs).
-        # tensorboard_loss_log('Train loss', np.array(train_loss_list), writer)
-
-        # Save epoch-wise train loss plot using TensorBoard.
-        tensorboard_loss_log(
-            'Train loss', 
-            np.array(train_loss_list_epoch), 
-            writer,
-            epoch
-        )
-
-        # Save mAP plot using TensorBoard.
-        tensorboard_map_log(
-            name='mAP', 
-            val_map_05=np.array(val_map_05), 
-            val_map=np.array(val_map),
-            writer=writer,
-            epoch=epoch
-        )
-
-        coco_log(OUT_DIR, stats)
-        csv_log(
-            OUT_DIR, 
-            stats, 
-            epoch,
-            train_loss_list,
-            loss_cls_list,
-            loss_box_reg_list,
-            loss_objectness_list,
-            loss_rpn_list
-        )
-
-        # WandB logging.
-        if not args['disable_wandb']:
-            wandb_log(
-                train_loss_hist.value,
-                batch_loss_list,
-                loss_cls_list,
-                loss_box_reg_list,
-                loss_objectness_list,
-                loss_rpn_list,
-                stats[1],
-                stats[0],
-                val_pred_image,
-                IMAGE_SIZE
-            )
-
-        # Save the current epoch model state. This can be used 
-        # to resume training. It saves model state dict, number of
-        # epochs trained for, optimizer state dict, and loss function.
-        save_model(
-            epoch, 
-            model, 
-            optimizer, 
-            train_loss_list, 
-            train_loss_list_epoch,
-            val_map,
-            val_map_05,
-            OUT_DIR,
-            data_configs,
-            args['model']
-        )
-        # Save the model dictionary only for the current epoch.
-        save_model_state(model, OUT_DIR, data_configs, args['model'])
-        # Save best model if the current mAP @0.5:0.95 IoU is
-        # greater than the last hightest.
-        save_best_model(
-            model, 
-            val_map[-1], 
-            epoch, 
-            OUT_DIR,
-            data_configs,
-            args['model']
-        )
-
-            # Early stopping check.
-        early_stopping(stats[0])
-        if early_stopping.early_stop:
-            break
-    
-    # Save models to Weights&Biases.
-    if not args['disable_wandb']:
-        wandb_save_model(OUT_DIR)
-
-
-if __name__ == '__main__':
-    args = parse_opt()
-    main(args)
+    print(f"Training finished. Best checkpoint: {output_dir / 'best.pt'}")
+    return model
