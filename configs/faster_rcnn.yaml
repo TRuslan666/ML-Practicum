@@ -1,18 +1,20 @@
-train_images: "data/processed/train/images"
-train_annotations: "data/processed/train/annotations_coco.json"
-val_images: "data/processed/val/images"
-val_annotations: "data/processed/val/annotations_coco.json"
+train_images: "data/raw/train/images"
+train_annotations: "data/raw/train/annotations_coco.json"
+val_images: "data/raw/val/images"
+val_annotations: "data/raw/val/annotations_coco.json"
 num_classes: 43
+backbone: "mobilenet_v3_large_fpn"
 
 # Conservative defaults for GTX 1660 Super (6 GB VRAM): avoid AMP/FP16, keep
 # images and batch small, and rely on gradient clipping in src/models/faster_rcnn.py.
 epochs: 50
 batch: 2
 imgsz: 512
-lr: 0.0001
+lr: 0.00001
 weight_decay: 0.0001
 grad_clip_norm: 1.0
 min_box_size: 2.0
+enforce_1660_super_limits: true
 seed: 42
 device: "cuda"
 project: "results/models"

@@ -10,8 +10,8 @@ Defaults are conservative for a GTX 1660 Super (6 GB VRAM): no AMP, small batch,
 low learning rate, gradient clipping and strict box/loss validation to prevent
 NaN/Inf from corrupting the model during training.
 """
-
 from __future__ import annotations
+
 
 import json
 import math
@@ -184,7 +184,7 @@ def train_faster_rcnn_from_config(config: dict[str, Any]) -> torch.nn.Module:
         weight_decay=float(config.get("weight_decay", 1e-4)),
         eps=1e-8,
     )
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=int(config.get("lr_step_size", 8)), gamma=0.1)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=int(config.get("lr_step_size", 15)), gamma=0.5)
     grad_clip_norm = float(config.get("grad_clip_norm", 1.0))
     epochs = int(config.get("epochs", 50))
 
@@ -202,8 +202,23 @@ def train_faster_rcnn_from_config(config: dict[str, Any]) -> torch.nn.Module:
             _assert_finite_targets(targets)
             images = [image.to(device, non_blocking=True) for image in images]
             targets = [{key: value.to(device, non_blocking=True) for key, value in target.items()} for target in targets]
-
             loss_dict = model(images, targets)
+            for t in targets:
+                b = t["boxes"]
+
+                if not torch.isfinite(b).all():
+                    raise RuntimeError("NaN bbox")
+
+                if (b[:, 2] <= b[:, 0]).any():
+                    print(b)
+                    raise RuntimeError("x2 <= x1")
+
+                if (b[:, 3] <= b[:, 1]).any():
+                    print(b)
+                    raise RuntimeError("y2 <= y1")
+            for img in images:
+                assert torch.isfinite(img).all()
+                
             losses = sum(loss for loss in loss_dict.values())
             if not torch.isfinite(losses):
                 details = {name: float(value.detach().cpu()) for name, value in loss_dict.items()}

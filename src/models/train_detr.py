@@ -1,4 +1,5 @@
 import os
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 import json
 import logging
 import random
@@ -31,7 +32,6 @@ print(torch.__version__)
 # Включить можно через переменную окружения снаружи: CUDA_LAUNCH_BLOCKING=1 python ...
 # 1. Создаем директорию для логов, если её нет
 log_dir = "results/logs"
-os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 os.makedirs(log_dir, exist_ok=True)
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic = False
