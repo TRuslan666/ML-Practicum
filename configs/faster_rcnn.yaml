@@ -1,0 +1,11 @@
+train_images: "data/processed/train/images"
+train_annotations: "data/processed/train/annotations_coco.json"
+val_images: "data/processed/val/images"
+val_annotations: "data/processed/val/annotations_coco.json"
+num_classes: 43
+epochs: 50
+batch: 8
+lr: 0.0005
+project: "results/models"
+name: "faster_rcnn_experiment"
+dataloader_num_workers: 0 # Для полной стабильности на Windows
