@@ -1,37 +1,29 @@
-"""Stable Faster R-CNN training for this project.
+"""Stable SSD training with Metrics, Logging, and Plotting.
 
-The project stores detection labels as COCO JSON files generated from YOLO
-labels.  This module intentionally does not depend on the external
-``torch_utils``/``datasets`` training template that used to be pasted here: it
-uses only PyTorch + TorchVision and is callable from ``main.py`` via
-``train_faster_rcnn_from_config``.
-
-Defaults are conservative for a GTX 1660 Super (6 GB VRAM): no AMP, small batch,
-low learning rate, gradient clipping and strict box/loss validation to prevent
-NaN/Inf from corrupting the model during training.
+Uses PyTorch + TorchVision + TorchMetrics.
 """
 from __future__ import annotations
-
 
 import json
 import math
 import random
+import logging
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
 import torch
+import matplotlib.pyplot as plt
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
-from torchvision.models.detection import FasterRCNN_ResNet50_FPN_Weights, fasterrcnn_resnet50_fpn
-from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.models.detection import SSD300_VGG16_Weights, ssd300_vgg16
 from torchvision.ops import clip_boxes_to_image
 from torchvision.transforms import functional as F
-from src.utils.logger import FasterRCNNLogger
-from src.utils.bbox_validator import BboxValidator  # путь поправьте под реальное расположение файла
 
-# .ppm is used by the traffic-sign dataset in this repository. Pillow can read it,
-# so no extra conversion step is required.
+# Импортируем официальную метрику COCO mAP
+from torchmetrics.detection.mean_ap import MeanAveragePrecision
+from src.utils.bbox_validator import BboxValidator
+
 SUPPORTED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".ppm", ".pgm", ".tif", ".tiff"}
 
 
@@ -131,91 +123,128 @@ def _collate_fn(batch: list[tuple[torch.Tensor, dict[str, torch.Tensor]]]) -> tu
     return list(images), list(targets)
 
 
-def _build_model(num_classes: int, image_size: int) -> torch.nn.Module:
-    weights = FasterRCNN_ResNet50_FPN_Weights.DEFAULT
-    model = fasterrcnn_resnet50_fpn(weights=weights, box_detections_per_img=100)
-    in_features = model.roi_heads.box_predictor.cls_score.in_features
-    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
-
+def _build_model(num_classes: int, image_size: int = 300) -> torch.nn.Module:
+    weights = SSD300_VGG16_Weights.DEFAULT
+    model = ssd300_vgg16(weights=weights, num_classes=num_classes, classifications_per_img=100)
     model.transform.min_size = (image_size,)
-    model.transform.max_size = max(image_size, 800)
+    model.transform.max_size = max(image_size, 300)
     return model
 
 
-def train_faster_rcnn_from_config(config: dict[str, Any]) -> torch.nn.Module:
-    """Train Faster R-CNN using ``configs/faster_rcnn.yaml`` style settings."""
+def _plot_history(history: dict[str, list[float]], output_dir: Path) -> None:
+    """Генерирует и сохраняет графики обучения."""
+    epochs = range(1, len(history["train_loss"]) + 1)
+    
+    plt.figure(figsize=(12, 5))
+    
+    # График лоссов
+    plt.subplot(1, 2, 1)
+    plt.plot(epochs, history["train_loss"], "-o", label="Total Train Loss")
+    plt.plot(epochs, history["cls_loss"], label="Class Loss", alpha=0.7)
+    plt.plot(epochs, history["box_loss"], label="Box Loss", alpha=0.7)
+    plt.title("Training Losses")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.grid(True)
+    plt.legend()
+    
+    # График метрики mAP
+    plt.subplot(1, 2, 2)
+    plt.plot(epochs, history["val_map"], "-o", color="green", label="Val mAP @50:95")
+    plt.plot(epochs, history["val_map_50"], "--", color="lime", label="Val mAP @50")
+    plt.title("Validation Metrics")
+    plt.xlabel("Epoch")
+    plt.ylabel("mAP")
+    plt.grid(True)
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig(output_dir / "learning_curves.png", dpi=150)
+    plt.close()
 
+
+def train_ssd_from_config(config: dict[str, Any]) -> torch.nn.Module:
+    """Train SSD with logging, mAP calculation, and plot generation."""
     seed = int(config.get("seed", 42))
     _seed_everything(seed)
+
+    output_dir = _resolve_path(config.get("project", "results/")) / config.get("name", "ssd_vgg16")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- НАСТРОЙКА ЛОГИРОВАНИЯ В ФАЙЛ И КОНСОЛЬ ---
+    logger = logging.getLogger("SSD_Training")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear() # Очистка старых хендлеров, если скрипт перезапускался
+    
+    file_handler = logging.FileHandler(output_dir / "train_log.txt", encoding="utf-8")
+    stream_handler = logging.StreamHandler()
+    formatter = logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    file_handler.setFormatter(formatter)
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
 
     device_name = config.get("device", "cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device(device_name if device_name != "cuda" or torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    image_size = int(config.get("imgsz", 512))
+    image_size = int(config.get("imgsz", 300))
     min_box_size = float(config.get("min_box_size", 2.0))
+    
     train_dataset = CocoDetectionDataset(config["train_images"], config["train_annotations"], min_box_size=min_box_size)
     val_dataset = CocoDetectionDataset(config["val_images"], config["val_annotations"], min_box_size=min_box_size)
 
     num_classes = int(config.get("num_classes", len(train_dataset.categories))) + 1
     model = _build_model(num_classes=num_classes, image_size=image_size).to(device)
 
-    batch_size = int(config.get("batch", 2))
+    batch_size = int(config.get("batch", 4))  
     workers = int(config.get("dataloader_num_workers", 0))
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=workers, collate_fn=_collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=workers, collate_fn=_collate_fn)
 
-    base_lr = float(config.get("lr", 1e-4))
+    base_lr = float(config.get("lr", 1e-3))
     optimizer = torch.optim.SGD(
         [p for p in model.parameters() if p.requires_grad],
-        lr=base_lr,  # Используем переменную из конфига!
+        lr=base_lr,
         momentum=0.9,
-        weight_decay=1e-4
+        weight_decay=float(config.get("weight_decay", 5e-4))
     )
 
-    # Warmup критичен для свежо инициализированной классификационной головы
-    # (FastRCNNPredictor создаётся со случайными весами под новое число классов).
-    # Без warmup AdamW может сделать один слишком агрессивный шаг в первые
-    # итерации и навсегда "посадить" cls_score в зону насыщения (NaN forever) —
-    # именно это и произошло на эпохе 3 в прошлом прогоне.
-    # Реализован вручную (не через SequentialLR), так как warmup должен идти
-    # по ШАГАМ, а основной StepLR — по ЭПОХАМ; смешивать эти две гранулярности
-    # в одном scheduler-объекте не получится корректно.
     warmup_steps = int(config.get("warmup_steps", 200))
 
     def _apply_warmup_lr(global_step: int) -> None:
         if global_step > warmup_steps:
             return
         if global_step == warmup_steps:
-            # По окончании вармапа жестко фиксируем базовый LR для планировщика
             for param_group in optimizer.param_groups:
                 param_group["lr"] = base_lr
             return
-            
         warmup_factor = (global_step + 1) / warmup_steps
         for param_group in optimizer.param_groups:
             param_group["lr"] = base_lr * warmup_factor
 
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=int(config.get("lr_step_size", 15)), gamma=0.5)
-    grad_clip_norm = float(config.get("grad_clip_norm", 0.5))  # ужесточили (было 1.0)
+    grad_clip_norm = float(config.get("grad_clip_norm", 1.0))
     epochs = int(config.get("epochs", 50))
 
-    output_dir = _resolve_path(config.get("project", "results/")) / config.get("name", "faster_rcnn")
-    logger = FasterRCNNLogger(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Единый валидатор на весь прогон обучения — копит статистику ошибок по всем
-    # эпохам, что удобно для финального отчёта ("сколько батчей пришлось
-    # пропустить из-за плохих данных").
     validator = BboxValidator(min_box_size=min_box_size, verbose=bool(config.get("verbose_validation", False)))
 
-    print(f"Device: {device}; train images: {len(train_dataset)}; val images: {len(val_dataset)}")
-    print(f"Faster R-CNN classes including background: {num_classes}; batch={batch_size}; imgsz={image_size}; amp=False")
+    logger.info(f"Device: {device}; Train images: {len(train_dataset)}; Val images: {len(val_dataset)}")
+    logger.info(f"SSD classes: {num_classes}; Batch size={batch_size}; Image size={image_size}")
 
-    best_loss = float("inf")
+    best_map = -1.0
     global_step = 0
-    MAX_VALID_LOSS = 15.0  # Порог взрыва лосса
+    MAX_VALID_LOSS = 20.0  
+
+    # Словарь для хранения истории обучения (для графиков)
+    history = {
+        "train_loss": [],
+        "cls_loss": [],
+        "box_loss": [],
+        "val_map": [],
+        "val_map_50": []
+    }
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -224,15 +253,13 @@ def train_faster_rcnn_from_config(config: dict[str, Any]) -> torch.nn.Module:
         total_batches = len(train_loader)
         cls_losses = []
         box_losses = []
-        obj_losses = []
-        rpn_losses = []
         
         for batch_idx, (images, targets) in enumerate(train_loader):
             try:
                 validator.validate_batch(images, targets)
             except ValueError as error:
                 skipped_batches += 1
-                print(f"[SKIP] epoch={epoch} batch={batch_idx}: {error}")
+                logger.warning(f"[SKIP DATA] Epoch={epoch} Batch={batch_idx}: {error}")
                 continue
 
             _apply_warmup_lr(global_step)
@@ -241,103 +268,92 @@ def train_faster_rcnn_from_config(config: dict[str, Any]) -> torch.nn.Module:
             images = [image.to(device, non_blocking=True) for image in images]
             targets = [{key: value.to(device, non_blocking=True) for key, value in target.items()} for target in targets]
 
-            # 1. Получаем словарь лоссов из модели
             loss_dict = model(images, targets)
-            
-            # 2. Считаем суммарный лосс
             losses = sum(loss for loss in loss_dict.values())
 
-            # 3. ПРОВЕРКА НА NAN/INF
-            if not torch.isfinite(losses):
+            if not torch.isfinite(losses) or losses.item() > MAX_VALID_LOSS:
                 details = {name: float(value.detach().cpu()) for name, value in loss_dict.items()}
-                print(f"[SKIP GRAD] epoch={epoch} batch={batch_idx}: non-finite loss {details}")
+                logger.error(f"[SKIP GRAD] Epoch={epoch} Batch={batch_idx}: Аномальный лосс ({losses.item():.4f})! Детали: {details}")
                 skipped_batches += 1
                 optimizer.zero_grad(set_to_none=True)
                 continue
 
-            # 4. ПРОВЕРКА НА ВЗРЫВ КОРРЕКТНОГО ЧИСЛА
-            if losses.item() > MAX_VALID_LOSS:
-                details = {name: float(value.detach().cpu()) for name, value in loss_dict.items()}
-                print(f"[SKIP GRAD] epoch={epoch} batch={batch_idx}: Exploding loss detected ({losses.item():.4f})! Details: {details}")
-                skipped_batches += 1
-                optimizer.zero_grad(set_to_none=True)
-                continue
+            cls_losses.append(loss_dict["classification"].item())
+            box_losses.append(loss_dict["bbox_regression"].item())
 
-            # 5. Сбор метрик для логирования (только если лосс валидный)
-            cls_losses.append(loss_dict["loss_classifier"].item())
-            box_losses.append(loss_dict["loss_box_reg"].item())
-            obj_losses.append(loss_dict["loss_objectness"].item())
-            rpn_losses.append(loss_dict["loss_rpn_box_reg"].item())
-
-            # 6. Шаг оптимизатора
             optimizer.zero_grad(set_to_none=True)
             losses.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
             optimizer.step()
             
-            # Сохраняем только валидные лоссы для подсчета среднего по эпохе
             epoch_losses.append(losses.item())
 
-        # КРИТИЧЕСКИЙ SAFEGUARD: если в эпохе пропущены вообще все батчи —
-        # модель уже мёртва (веса дали NaN навсегда), продолжать ещё 40+ эпох
-        # бессмысленно и просто жжёт GPU-время впустую. Останавливаемся сразу
-        # и явно говорим об этом, а не тихо ползём до конца.
         if total_batches > 0 and skipped_batches == total_batches:
-            raise RuntimeError(
-                f"Эпоха {epoch}: ВСЕ {total_batches} батчей пропущены из-за non-finite loss. "
-                f"Модель, вероятнее всего, безвозвратно повреждена (NaN-веса в classifier head). "
-                f"Используйте последний валидный чекпоинт ({output_dir / 'best.pt'}) и перезапустите "
-                f"обучение с меньшим learning_rate / увеличенным warmup_steps, а не продолжайте этот прогон."
-            )
+            logger.critical(f"Эпоха {epoch}: ВСЕ батчи упали или отфильтрованы! Остановка.")
+            raise RuntimeError(f"Эпоха {epoch}: Обучение сорвано взрывом градиентов.")
 
         scheduler.step()
-        train_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else float("nan")
-        print(f"Epoch {epoch:03d}/{epochs}: train_loss={train_loss:.5f}; "
-              f"пропущено батчей: {skipped_batches}/{total_batches}; {validator.get_error_summary()}")
         
-        avg_cls = 0.0
-        avg_box = 0.0
-        avg_obj = 0.0
-        avg_rpn = 0.0
+        # Считаем средние лоссы за эпоху
+        train_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else float("nan")
+        avg_cls = sum(cls_losses) / len(cls_losses) if cls_losses else 0.0
+        avg_box = sum(box_losses) / len(box_losses) if box_losses else 0.0
 
-        if cls_losses:
-            avg_cls = sum(cls_losses) / len(cls_losses)
-            avg_box = sum(box_losses) / len(box_losses)
-            avg_obj = sum(obj_losses) / len(obj_losses)
-            avg_rpn = sum(rpn_losses) / len(rpn_losses)
-        else:
-            avg_cls = avg_box = avg_obj = avg_rpn = 0.0
+        # --- ВАЛИДАЦИЯ И РАСЧЕТ mAP ЧЕРЕЗ TORCHMETRICS ---
+        model.eval()
+        # Инициализируем метрику COCO mAP (подсчет mAP@50:95 и mAP@50)
+        metric_coco = MeanAveragePrecision(box_format="xyxy")
+        
+        logger.info(f"Запуск валидации для Эпохи {epoch:03d}...")
+        with torch.no_grad():
+            for images, targets in val_loader:
+                images_dev = [img.to(device) for img in images]
+                outputs = model(images_dev)
+                
+                # Переносим предсказания и таргеты на CPU в формате, который ждет torchmetrics
+                preds = [{k: v.cpu() for k, v in out.items()} for out in outputs]
+                targets_cpu = [{k: v.cpu() for k, v in tg.items()} for tg in targets]
+                
+                metric_coco.update(preds, targets_cpu)
+        
+        # Вычисляем финальные метрики валидации
+        metrics_results = metric_coco.compute()
+        val_map = float(metrics_results["map"].item())
+        val_map_50 = float(metrics_results["map_50"].item())
 
-        logger.log_epoch(
-            epoch=epoch,
-            train_loss=train_loss,
-            loss_classifier=avg_cls,
-            loss_box_reg=avg_box,
-            loss_objectness=avg_obj,
-            loss_rpn_box_reg=avg_rpn,
-            lr=optimizer.param_groups[0]["lr"],
-            skipped_batches=skipped_batches,
+        # Логируем итоги эпохи
+        logger.info(
+            f"Epoch {epoch:03d}/{epochs} Закончена. "
+            f"Train Loss: {train_loss:.4f} [Cls: {avg_cls:.4f}, Box: {avg_box:.4f}] | "
+            f"Val mAP@50:95: {val_map:.4f} | Val mAP@50: {val_map_50:.4f} | "
+            f"Пропущено батчей: {skipped_batches}/{total_batches}"
         )
 
+        # Сохраняем значения в историю
+        history["train_loss"].append(train_loss)
+        history["cls_loss"].append(avg_cls)
+        history["box_loss"].append(avg_box)
+        history["val_map"].append(val_map)
+        history["val_map_50"].append(val_map_50)
+
+        # Перестраиваем графики каждую эпоху
+        _plot_history(history, output_dir)
+
+        # Сохранение чекпоинтов
         checkpoint = {
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
-            "num_classes": num_classes,
-            "label_to_name": train_dataset.label_to_name,
+            "metrics": {"map": val_map, "map_50": val_map_50},
             "config": config,
         }
         torch.save(checkpoint, output_dir / "last.pt")
-        if train_loss < best_loss:
-            best_loss = train_loss
+        
+        # Сохраняем модель по лучшей метрике mAP, а не по лоссу!
+        if val_map > best_map:
+            best_map = val_map
             torch.save(checkpoint, output_dir / "best.pt")
+            logger.info(f"--> Найдена лучшая модель на эпохе {epoch} с mAP: {best_map:.4f}! Сохранено в best.pt")
 
-        model.eval()
-        with torch.no_grad():
-            for images, _targets in val_loader:
-                _ = model([image.to(device, non_blocking=True) for image in images])
-                break
-
-    print(f"Training finished. Best checkpoint: {output_dir / 'best.pt'}")
-    print(f"Итоговая статистика валидации за весь прогон: {validator.get_error_summary()}")
+    logger.info(f"Обучение успешно завершено. Все результаты сохранены в: {output_dir}")
     return model

@@ -5,8 +5,6 @@ val_annotations: "data/raw/val/annotations_coco.json"
 num_classes: 43
 backbone: "mobilenet_v3_large_fpn"
 
-# Conservative defaults for GTX 1660 Super (6 GB VRAM): avoid AMP/FP16, keep
-# images and batch small, and rely on gradient clipping in src/models/faster_rcnn.py.
 epochs: 50
 batch: 2
 imgsz: 512
@@ -17,6 +15,6 @@ min_box_size: 2.0
 enforce_1660_super_limits: true
 seed: 42
 device: "cuda"
-project: "results/models"
-name: "faster_rcnn_experiment"
-dataloader_num_workers: 0 # Stable on Windows and low-RAM machines.
+project: "results/"
+name: "faster_rcnn"
+dataloader_num_workers: 0 

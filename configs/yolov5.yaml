@@ -3,5 +3,6 @@ data_yaml: data/raw/dataset.yaml
 epochs: 50
 imgsz: 640
 batch: 16
-project: results/plots
+project: results/yolov5
 name: yolov5
+save_dir: results/yolov5
