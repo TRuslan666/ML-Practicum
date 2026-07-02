@@ -1,0 +1,52 @@
+seed: 42
+
+# датасет
+data:
+  root: data/raw                     
+  processed: data/processed         
+  img_size: 512                      
+  norm_mean: [0.485, 0.456, 0.406]   
+  norm_std:  [0.229, 0.224, 0.225]
+
+# модели
+models:
+  - yolov8
+  - yolov5
+  - faster_rcnn
+  - ssd
+  - retinanet
+
+# обучение
+train:
+  epochs: 20
+  batch_size: 4                 
+  optimizer: adamw
+  lr: 0.0005
+  weight_decay: 0.0005
+  lr_scheduler: cosine
+  warmup_epochs: 3
+  grad_clip: 1.0
+  amp: false # включаем, если есть CUDA
+  num_workers: 4
+  device: cuda
+  early_stopping_patience: 100
+
+# аугментации
+augment:
+  hflip: 0.5
+  brightness_contrast: 0.25
+  hue_sat: 0.15
+  scale_rotate: 0.1
+  blur: 0.05
+
+# результаты
+output:
+  checkpoints: results/checkpoints
+  logs: results/logs
+  plots: results/plots
+
+# оценка
+eval:
+  iou_threshold: 0.5
+  conf_threshold: 0.25
+  nms_iou: 0.5
